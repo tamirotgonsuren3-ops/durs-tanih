@@ -1,0 +1,12 @@
+streamlit>=1.49
+streamlit-webrtc>=0.47
+aiortc>=1.11
+av>=12
+tornado
+opencv-python-headless
+face-recognition
+face-recognition-models
+dlib>=19.24
+numpy
+pandas
+Pillow
