@@ -1,5 +1,5 @@
 streamlit>=1.49
-streamlit-webrtc>=0.47
+streamlit-webrtc>=0.78
 aiortc>=1.11
 av>=12
 tornado

@@ -1,1 +1,4 @@
 __pycache__
+.certs/
+face_encodings.pkl
+attendance.csv

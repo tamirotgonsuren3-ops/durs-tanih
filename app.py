@@ -16,9 +16,22 @@ must stay free of Streamlit API calls — they run outside the script thread.
 
 import os
 import pickle
+import socket
+import subprocess
 import tempfile
 import time
 from datetime import timedelta
+
+# Temporary WebRTC diagnostics: start the server with WEBRTC_DEBUG=1
+if os.environ.get("WEBRTC_DEBUG"):
+    import logging
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+    for _noisy in ("PIL", "matplotlib", "asyncio"):
+        logging.getLogger(_noisy).setLevel(logging.INFO)
 
 import av
 import cv2
@@ -43,22 +56,58 @@ ATTENDANCE_PATH = "attendance.csv"
 VIDEO_TYPES = ["mp4", "avi", "mov", "mkv", "webm", "m4v", "mpg", "mpeg", "wmv", "wav"]
 IMAGE_TYPES = ["jpg", "jpeg", "png", "bmp", "webp"]
 
-RTC_CONFIGURATION = RTCConfiguration(
-    {
-        "iceServers": [
-            {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]},
-            {
-                "urls": [
-                    "turn:openrelay.metered.ca:80",
-                    "turn:openrelay.metered.ca:443",
-                    "turn:openrelay.metered.ca:443?transport=tcp",
-                ],
-                "username": "openrelayproject",
-                "credential": "openrelayproject",
-            },
-        ]
-    }
-)
+# --- ICE servers: Google STUN + local coturn TURN (run.sh starts it) -------- #
+TURN_PORT = 3478
+TURN_USER = "attendance"
+TURN_PASS = "attendance-secret"
+
+
+def _local_ips() -> list[str]:
+    """Non-loopback IPv4 addresses of this machine (LAN + public if assigned)."""
+    ips: list[str] = []
+    try:
+        out = subprocess.run(
+            ["hostname", "-I"], capture_output=True, text=True, timeout=3
+        ).stdout
+        ips = [x for x in out.split() if x.count(".") == 3]
+    except Exception:
+        pass
+    if not ips:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ips = [s.getsockname()[0]]
+            s.close()
+        except Exception:
+            pass
+    return [ip for ip in ips if not ip.startswith("127.") and ip != "0.0.0.0"]
+
+
+def _tcp_reachable(host: str, port: int, timeout: float = 0.4) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+@st.cache_data(show_spinner=False, ttl=60)
+def get_rtc_configuration() -> RTCConfiguration:
+    """Google STUN + TURN entries only for local TURN servers that are
+    actually reachable (started by run.sh via docker)."""
+    servers: list = [
+        {"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}
+    ]
+    for ip in _local_ips():
+        if _tcp_reachable(ip, TURN_PORT):
+            servers.append(
+                {
+                    "urls": [f"turn:{ip}:{TURN_PORT}?transport=tcp", f"turn:{ip}:{TURN_PORT}"],
+                    "username": TURN_USER,
+                    "credential": TURN_PASS,
+                }
+            )
+    return RTCConfiguration(iceServers=servers)
 
 if "attendance_active" not in st.session_state:
     st.session_state.attendance_active = False
@@ -312,6 +361,54 @@ def page_attendance():
         _page_live(check_type, input_source)
 
 
+def _camera_diagnostics() -> None:
+    """Browser-side check: is the page a secure context and is the camera API
+    available? (The #1 reason the camera silently fails is an HTTP origin.)"""
+    st.iframe(
+        """
+        <div id="camdiag" style="font-family: system-ui, sans-serif; font-size: 14px;
+             padding: 8px 12px; border-radius: 6px; margin: 4px 0 8px 0;"></div>
+        <script>
+        (function () {
+          var el = document.getElementById('camdiag');
+          function set(bg, fg, text) {
+            el.style.background = bg; el.style.color = fg; el.textContent = text;
+          }
+          var secure = window.isSecureContext;
+          var md = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+          if (!secure) {
+            set('#ffe0e0', '#8b0000',
+              '🔒 Хуудас HTTP дээр байна — браузер камер ашиглахыг хаана. ' +
+              'run.sh HTTPS автоматаар асаадаг: https:// IP/laptop хаягаар нээнэ үү ' +
+              '(гэхдээ сертификатын анхааруулгыг зөвшөөрнө үү).');
+          } else if (!md) {
+            set('#ffe0e0', '#8b0000',
+              '⚠ navigator.mediaDevices олдсонгүй — HTTPS/localhost биш эсвэл хуучин browser.');
+          } else if (navigator.permissions && navigator.permissions.query) {
+            navigator.permissions.query({name: 'camera'}).then(function (s) {
+              if (s.state === 'denied') {
+                set('#ffe0e0', '#8b0000',
+                  '⛔ Камерын эрх умгарсан (denied) — browser-ийн цэсээс зөвшөөрөлөө нээнэ үү.');
+              } else if (s.state === 'granted') {
+                set('#e0ffe0', '#006400',
+                  '✅ Secure context + Camera API бэлэн, эрх зөвшөөрөгдсөн.');
+              } else {
+                set('#fff4d6', '#7a5b00',
+                  '🟡 Camera API бэлэн — Start дарахад browser эрх асуух болно (зөвшөөрнө үү).');
+              }
+            }).catch(function () {
+              set('#e0ffe0', '#006400', '✅ Secure context + Camera API бэлэн.');
+            });
+          } else {
+            set('#e0ffe0', '#006400', '✅ Secure context + Camera API бэлэн.');
+          }
+        })();
+        </script>
+        """,
+        height=56,
+    )
+
+
 def _page_live(check_type: str, input_source: str) -> None:
     """Webcam / mobile front-camera flow: Start & Stop buttons."""
     col_start, col_stop = st.columns([1, 1])
@@ -335,6 +432,8 @@ def _page_live(check_type: str, input_source: str) -> None:
     if stop:
         st.session_state.attendance_active = False
         st.rerun()
+
+    _camera_diagnostics()
 
     if not st.session_state.attendance_active:
         st.info(
@@ -364,17 +463,27 @@ def _page_live(check_type: str, input_source: str) -> None:
         webrtc_ctx = webrtc_streamer(
             key=f"attendance-{key}-{check_type}",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIGURATION,
+            rtc_configuration=get_rtc_configuration(),
             media_stream_constraints=constraints,
             video_processor_factory=lambda: AttendanceProcessor(check_type),
-            desired_playing_state=True,
+            # NOTE: desired_playing_state is intentionally NOT set. Auto-starting
+            # made the component spawn a new RTCPeerConnection on every Streamlit
+            # rerun during negotiation, mixing ICE generations so every check was
+            # rejected and the stream never connected. A single user click on the
+            # component's own Start button creates exactly one connection.
         )
     except Exception as e:  # e.g. no browser session / headless context
         webrtc_ctx = None
         st.error(f"Could not start the camera stream: {e}")
 
     if webrtc_ctx is not None and not webrtc_ctx.state.playing:
-        st.warning("Camera stream is not active — press **Start** (or allow camera access).")
+        st.warning(
+            "Camera is not streaming yet — press **Start** inside the video "
+            "panel below (one click), and allow camera access if asked."
+        )
+        st.caption(
+            "Ердөө нэг удаа: доорх видео самбар доторх **Start** товчийг дарна уу."
+        )
 
     _render_today_records()
 
